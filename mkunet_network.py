@@ -101,9 +101,9 @@ class MKIR(nn.Module):
     Bloc résiduel inversé multi-noyaux (extension de MobileNetV2).
 
     Schéma :
-      x ──► PW-expand ──► MKDC ──► agrégation ──► PW-project ──► (+) ──► sortie
-      │                                                                ▲
-      └────────────────────────── skip (si stride=1) ─────────────────┘
+      x ──► PW-expand ──► MKDC ──► channel_shuffle ──► agrégation ──► PW-project ──► (+) ──► sortie
+      │                                                                                    ▲
+      └──────────────────────────────── skip (si stride=1) ───────────────────────────────┘
 
     Agrégation : somme des sorties MKDC (conserve C_expanded canaux).
 
@@ -144,12 +144,15 @@ class MKIR(nn.Module):
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
             if self.use_skip and in_channels != out_channels else None
         )
+        self._shuffle_groups = _gcd(C_exp, out_channels)
         self.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         expanded = self.pw_expand(x)
         # Somme des sorties de chaque branche MKDC
         aggregated = sum(self.mkdc(expanded))
+        # Channel shuffle avant projection (fidèle au papier)
+        aggregated = _channel_shuffle(aggregated, self._shuffle_groups)
         projected = self.pw_project(aggregated)
 
         if self.use_skip:
@@ -232,25 +235,32 @@ class GAG(nn.Module):
     Calcule ψ = σ(W_ψ · ReLU(W_g·g + W_x·x)) puis renvoie x · ψ.
     g est le signal décodeur, x la feature encodeur correspondante.
 
+    Les convolutions W_g et W_x sont GROUPÉES (groups = inter_channels)
+    pour réduire le nombre de paramètres de O(C²) à O(C).
+
     Paramètres
     ----------
     gate_channels   : C de g (signal décodeur)
     feat_channels   : C de x (feature encodeur)
-    inter_channels  : C intermédiaires du bottleneck
+    inter_channels  : C intermédiaires du bottleneck  (= C//2 typiquement)
     kernel_size     : noyau des projections W_g et W_x (1 ou 3)
     """
     def __init__(self, gate_channels: int, feat_channels: int,
                  inter_channels: int, kernel_size: int = 3):
         super().__init__()
         pad = kernel_size // 2
+        # CORRECTION : groups=inter_channels → conv groupée (O(C) params, pas O(C²))
+        groups = inter_channels
         self.Wg = nn.Sequential(
             nn.Conv2d(gate_channels, inter_channels,
-                      kernel_size=kernel_size, padding=pad, bias=True),
+                      kernel_size=kernel_size, padding=pad,
+                      groups=groups, bias=True),
             nn.BatchNorm2d(inter_channels),
         )
         self.Wx = nn.Sequential(
             nn.Conv2d(feat_channels, inter_channels,
-                      kernel_size=kernel_size, padding=pad, bias=True),
+                      kernel_size=kernel_size, padding=pad,
+                      groups=groups, bias=True),
             nn.BatchNorm2d(inter_channels),
         )
         self.psi = nn.Sequential(
@@ -277,7 +287,8 @@ class MKUNet(nn.Module):
 
     Encodeur  : 5 étages MKIR + MaxPool 2×2
     Décodeur  : CA → SA → upsample → GAG(skip) → add, ×5 étages
-    Sortie    : logits à résolution pleine (avant sigmoid)
+    Sortie    : 4 têtes de segmentation (supervision profonde) ;
+                retourne [p4] par défaut (logits pleine résolution)
 
     Paramètres
     ----------
@@ -307,7 +318,7 @@ class MKUNet(nn.Module):
         self.enc4 = _build_mkir_stage(C[2], C[3], N[3], stride=1, **mkir_kw)
         self.enc5 = _build_mkir_stage(C[3], C[4], N[4], stride=1, **mkir_kw)
 
-        # GAG pour chaque skip connection
+        # GAG pour chaque skip connection (convolutions groupées : groups = C//2)
         self.gag = nn.ModuleList([
             GAG(C[3], C[3], C[3] // 2, kernel_size=gag_kernel),
             GAG(C[2], C[2], C[2] // 2, kernel_size=gag_kernel),
@@ -327,14 +338,17 @@ class MKUNet(nn.Module):
         self.ca_list = nn.ModuleList([CA(C[4-i], reduction_ratio=ratios[i]) for i in range(5)])
         self.sa = SA(kernel_size=7)
 
-        # Tête de segmentation finale
-        self.seg_head = nn.Conv2d(C[0], num_classes, kernel_size=1)
+        # Têtes de segmentation (supervision profonde, fidèle au papier)
+        self.out1 = nn.Conv2d(C[2], num_classes, kernel_size=1)
+        self.out2 = nn.Conv2d(C[1], num_classes, kernel_size=1)
+        self.out3 = nn.Conv2d(C[0], num_classes, kernel_size=1)
+        self.out4 = nn.Conv2d(C[0], num_classes, kernel_size=1)
 
     @staticmethod
     def _upsample2x(x: torch.Tensor) -> torch.Tensor:
         return F.relu(F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> list:
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
 
@@ -354,20 +368,25 @@ class MKUNet(nn.Module):
         d = self.ca_list[1](d) * d
         d = self.sa(d) * d
         d = self._upsample2x(self.dec2(d))
+        p1 = F.interpolate(self.out1(d), scale_factor=8, mode='bilinear', align_corners=False)
         d = d + self.gag[1](d, s3)
 
         d = self.ca_list[2](d) * d
         d = self.sa(d) * d
         d = self._upsample2x(self.dec3(d))
+        p2 = F.interpolate(self.out2(d), scale_factor=4, mode='bilinear', align_corners=False)
         d = d + self.gag[2](d, s2)
 
         d = self.ca_list[3](d) * d
         d = self.sa(d) * d
         d = self._upsample2x(self.dec4(d))
+        p3 = F.interpolate(self.out3(d), scale_factor=2, mode='bilinear', align_corners=False)
         d = d + self.gag[3](d, s1)
 
         d = self.ca_list[4](d) * d
         d = self.sa(d) * d
         d = self._upsample2x(self.dec5(d))
 
-        return self.seg_head(d)   # logits, shape (B, num_classes, H, W)
+        p4 = self.out4(d)   # logits pleine résolution, shape (B, num_classes, H, W)
+
+        return [p4]  # [p4, p3, p2, p1] pour activer la supervision profonde
